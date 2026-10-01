@@ -6,6 +6,10 @@ import android.content.pm.PackageManager
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.media.AudioAttributes
 import android.os.Bundle
 import android.os.Looper
@@ -20,6 +24,7 @@ import androidx.camera.core.ImageProxy
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
+import kotlin.math.sqrt
 
 private const val SPEED_ALERT_KMH = 80f
 private const val SPEED_REMINDER_INTERVAL_MS = 20_000L
@@ -40,10 +45,15 @@ data class DriveUiState(
 class DriveAssistController(
     context: Context,
     private val onStateChanged: (DriveUiState) -> Unit,
-) : LocationListener {
+    private val onSafetyEvent: (String) -> Unit,
+) : LocationListener, SensorEventListener {
     private val appContext = context.applicationContext
     private val mainHandler = android.os.Handler(Looper.getMainLooper())
     private val locationManager = appContext.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+    private val sensorManager = appContext.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+    private val gravityEstimate = FloatArray(3)
+    private var gravityInitialized = false
+    private var lastSafetyEventAt = 0L
     private val textRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     private val stateLock = Any()
     private var uiState = DriveUiState()
@@ -110,6 +120,11 @@ class DriveAssistController(
                 ocrStatus = "On-device sign reader starting",
             )
         }
+        gravityInitialized = false
+        lastSafetyEventAt = 0L
+        sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.let { accelerometer ->
+            sensorManager.registerListener(this, accelerometer, SensorManager.SENSOR_DELAY_GAME, mainHandler)
+        }
 
         val fineGranted = ContextCompat.checkSelfPermission(
             appContext,
@@ -146,6 +161,8 @@ class DriveAssistController(
     }
 
     fun stopMonitoring() {
+        sensorManager.unregisterListener(this)
+        gravityInitialized = false
         try {
             locationManager.removeUpdates(this)
         } catch (_: SecurityException) {
@@ -230,11 +247,16 @@ class DriveAssistController(
         val rawSpeedKmh = max(0f, location.speed * 3.6f)
         if (!rawSpeedKmh.isFinite() || rawSpeedKmh > 250f) return
         val previous = filteredSpeedKmh
+        val previousLocationAt = lastValidLocationAt
         // Smooth ordinary GPS jitter while still reacting promptly to sustained speed changes.
         val smoothed = if (previous == null) rawSpeedKmh else previous * 0.55f + rawSpeedKmh * 0.45f
+        val now = SystemClock.elapsedRealtime()
+        val elapsedSincePrevious = if (previousLocationAt > 0L) now - previousLocationAt else Long.MAX_VALUE
+        val rapidSlowdown = previous != null &&
+            elapsedSincePrevious in 500L..2_500L &&
+            previous - smoothed >= 15f
         filteredSpeedKmh = smoothed
         val overSpeed = smoothed > SPEED_ALERT_KMH
-        val now = SystemClock.elapsedRealtime()
         lastValidLocationAt = now
         mainHandler.removeCallbacks(clearStaleSpeed)
         mainHandler.postDelayed(clearStaleSpeed, 6_000L)
@@ -256,6 +278,37 @@ class DriveAssistController(
         if (shouldWarn) {
             speak("Your speed is above 80 kilometers per hour. Please drive carefully.", urgent = true)
         }
+        if (rapidSlowdown) reportSafetyEvent("Rapid slowdown")
+    }
+
+    override fun onSensorChanged(event: SensorEvent) {
+        if (event.sensor.type != Sensor.TYPE_ACCELEROMETER) return
+        val running = synchronized(stateLock) { uiState.isRunning }
+        if (!running) return
+
+        val values = event.values
+        if (!gravityInitialized) {
+            for (index in 0..2) gravityEstimate[index] = values[index]
+            gravityInitialized = true
+            return
+        }
+
+        val alpha = 0.8f
+        val dx = values[0] - gravityEstimate[0]
+        val dy = values[1] - gravityEstimate[1]
+        val dz = values[2] - gravityEstimate[2]
+        for (index in 0..2) gravityEstimate[index] = alpha * gravityEstimate[index] + (1f - alpha) * values[index]
+        val linearAcceleration = sqrt(dx * dx + dy * dy + dz * dz)
+        if (linearAcceleration >= 5f) reportSafetyEvent("Sudden motion")
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+
+    private fun reportSafetyEvent(reason: String) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastSafetyEventAt < 20_000L) return
+        lastSafetyEventAt = now
+        onSafetyEvent(reason)
     }
 
     @Deprecated("Deprecated by Android; retained for compatibility with LocationListener.")

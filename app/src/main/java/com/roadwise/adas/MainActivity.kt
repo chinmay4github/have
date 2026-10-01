@@ -1,28 +1,16 @@
 package com.roadwise.adas
 
 import android.Manifest
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraManager
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
-import android.util.Log
-import android.util.Range
-import android.util.Size
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.camera.camera2.interop.Camera2CameraInfo
-import androidx.camera.camera2.interop.ExperimentalCamera2Interop
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
-import androidx.camera.core.Preview
-import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -40,6 +28,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -85,7 +74,6 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
-import java.util.concurrent.Executors
 
 private val Background = Color(0xFF08131B)
 private val PanelColor = Color(0xFF101F29)
@@ -105,12 +93,15 @@ private data class MusicUiState(
 
 class MainActivity : ComponentActivity() {
     private var driveState by mutableStateOf(DriveUiState())
+    private var dashcamState by mutableStateOf(DashcamUiState())
     private var musicState by mutableStateOf(MusicUiState())
+    private var routeStatus by mutableStateOf("Route guidance opens in your maps app.")
     private var cameraPermissionGranted by mutableStateOf(false)
     private var locationPermissionGranted by mutableStateOf(false)
     private var pendingStart = false
 
     private lateinit var driveController: DriveAssistController
+    private lateinit var dashcamController: DashcamCameraController
     private var exoPlayer: ExoPlayer? = null
 
     private val permissionLauncher = registerForActivityResult(
@@ -137,20 +128,30 @@ class MainActivity : ComponentActivity() {
         window.statusBarColor = android.graphics.Color.rgb(8, 19, 27)
         window.navigationBarColor = android.graphics.Color.rgb(8, 19, 27)
         refreshPermissions()
-        driveController = DriveAssistController(this) { next -> driveState = next }
+        dashcamController = DashcamCameraController(this) { next -> dashcamState = next }
+        driveController = DriveAssistController(
+            context = this,
+            onStateChanged = { next -> driveState = next },
+            onSafetyEvent = dashcamController::captureSafetyEvent,
+        )
 
         setContent {
             RoadwiseApp(
                 state = driveState,
+                dashcam = dashcamState,
                 music = musicState,
+                routeStatus = routeStatus,
                 cameraPermissionGranted = cameraPermissionGranted,
                 locationPermissionGranted = locationPermissionGranted,
                 onStartMonitoring = ::requestStart,
                 onStopMonitoring = ::stopMonitoring,
                 onChooseAudio = { audioPicker.launch(arrayOf("audio/*")) },
                 onToggleAudio = ::toggleAudio,
+                onToggleEventCapture = { dashcamController.setEventRecordingArmed(!dashcamState.isArmed) },
+                onToggleManualRecording = dashcamController::toggleManualRecording,
+                onOpenRoute = ::openRoute,
                 onAnalyzeFrame = driveController::analyzeFrame,
-                onCameraStatus = driveController::updateCameraStatus,
+                cameraController = dashcamController,
             )
         }
     }
@@ -164,12 +165,14 @@ class MainActivity : ComponentActivity() {
         if (::driveController.isInitialized && driveState.isRunning) {
             driveController.stopMonitoring()
         }
+        if (::dashcamController.isInitialized) dashcamController.stopForBackground()
         exoPlayer?.pause()
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         super.onStop()
     }
 
     override fun onDestroy() {
+        if (::dashcamController.isInitialized) dashcamController.release()
         if (::driveController.isInitialized) driveController.release()
         exoPlayer?.release()
         exoPlayer = null
@@ -215,7 +218,36 @@ class MainActivity : ComponentActivity() {
 
     private fun stopMonitoring() {
         driveController.stopMonitoring()
+        dashcamController.stopForBackground()
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    private fun openRoute(destination: String) {
+        val query = destination.trim()
+        if (query.isBlank()) {
+            routeStatus = "Enter a destination first."
+            return
+        }
+        if (driveState.isRunning) {
+            routeStatus = "Stop monitoring before handing off to navigation."
+            return
+        }
+
+        val navigationIntent = Intent(
+            Intent.ACTION_VIEW,
+            Uri.parse("google.navigation:q=${Uri.encode(query)}&mode=d"),
+        ).setPackage("com.google.android.apps.maps")
+        try {
+            startActivity(navigationIntent)
+            routeStatus = "Route opened in Google Maps. Roadwise remains paused during navigation."
+        } catch (_: Exception) {
+            try {
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=${Uri.encode(query)}")))
+                routeStatus = "Route opened in your maps app. Roadwise remains paused during navigation."
+            } catch (_: Exception) {
+                routeStatus = "No map app found. Install a maps app, then try again."
+            }
+        }
     }
 
     private fun loadAudio(uri: Uri) {
@@ -288,15 +320,20 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun RoadwiseApp(
     state: DriveUiState,
+    dashcam: DashcamUiState,
     music: MusicUiState,
+    routeStatus: String,
     cameraPermissionGranted: Boolean,
     locationPermissionGranted: Boolean,
     onStartMonitoring: () -> Unit,
     onStopMonitoring: () -> Unit,
     onChooseAudio: () -> Unit,
     onToggleAudio: () -> Unit,
+    onToggleEventCapture: () -> Unit,
+    onToggleManualRecording: () -> Unit,
+    onOpenRoute: (String) -> Unit,
     onAnalyzeFrame: (ImageProxy) -> Unit,
-    onCameraStatus: (String) -> Unit,
+    cameraController: DashcamCameraController,
 ) {
     MaterialTheme(
         colorScheme = darkColorScheme(
@@ -320,7 +357,6 @@ private fun RoadwiseApp(
                 verticalArrangement = Arrangement.spacedBy(15.dp),
             ) {
                 AppHeader(isRunning = state.isRunning)
-                SpeedPanel(state = state)
                 MonitoringButton(
                     isRunning = state.isRunning,
                     hasCameraPermission = cameraPermissionGranted,
@@ -329,11 +365,20 @@ private fun RoadwiseApp(
                 )
                 CameraPanel(
                     state = state,
+                    dashcam = dashcam,
                     cameraPermissionGranted = cameraPermissionGranted,
                     onAnalyzeFrame = onAnalyzeFrame,
-                    onCameraStatus = onCameraStatus,
+                    cameraController = cameraController,
+                    onToggleEventCapture = onToggleEventCapture,
+                    onToggleManualRecording = onToggleManualRecording,
                 )
+                SpeedPanel(state = state)
                 SignPanel(state = state)
+                NavigationPanel(
+                    isMonitoring = state.isRunning,
+                    routeStatus = routeStatus,
+                    onOpenRoute = onOpenRoute,
+                )
                 AudioPanel(
                     music = music,
                     isMonitoring = state.isRunning,
@@ -543,9 +588,12 @@ private fun MonitoringButton(
 @Composable
 private fun CameraPanel(
     state: DriveUiState,
+    dashcam: DashcamUiState,
     cameraPermissionGranted: Boolean,
     onAnalyzeFrame: (ImageProxy) -> Unit,
-    onCameraStatus: (String) -> Unit,
+    cameraController: DashcamCameraController,
+    onToggleEventCapture: () -> Unit,
+    onToggleManualRecording: () -> Unit,
 ) {
     Panel(modifier = Modifier.fillMaxWidth()) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -555,52 +603,62 @@ private fun CameraPanel(
                 }
             }
             Spacer(Modifier.width(10.dp))
-            Column {
-                Text("CAMERA SIGN READER", color = Foreground, fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.8.sp)
-                Text("Rear camera · on-device text recognition", color = Muted, fontSize = 10.sp)
+            Column(modifier = Modifier.weight(1f)) {
+                Text("ROAD CAMERA", color = Foreground, fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                Text("Live sign reader · local dashcam", color = Muted, fontSize = 10.sp)
+            }
+            if (state.isRunning && dashcam.isRecording) {
+                CameraBadge(text = "REC ${formatClock(dashcam.recordingSeconds)}", tint = Danger)
             }
         }
 
-        Spacer(Modifier.height(13.dp))
+        Spacer(Modifier.height(12.dp))
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(214.dp)
-                .clip(RoundedCornerShape(17.dp))
+                .height(246.dp)
+                .clip(RoundedCornerShape(18.dp))
                 .background(Color(0xFF071016)),
         ) {
             if (state.isRunning && cameraPermissionGranted) {
                 CameraLiveView(
+                    cameraController = cameraController,
                     onAnalyzeFrame = onAnalyzeFrame,
-                    onCameraStatus = onCameraStatus,
                     modifier = Modifier.fillMaxSize(),
                 )
-                Column(
-                    modifier = Modifier
-                        .align(Alignment.TopStart)
-                        .padding(11.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                Row(
+                    modifier = Modifier.fillMaxWidth().align(Alignment.TopStart).padding(11.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
                     CameraBadge(text = "LIVE", tint = Accent)
-                    CameraBadge(text = "LOCAL OCR", tint = Foreground)
+                    Spacer(Modifier.weight(1f))
+                    CameraBadge(
+                        text = if (dashcam.isArmed) "EVENTS ARMED" else "EVENTS OFF",
+                        tint = if (dashcam.isArmed) Amber else Muted,
+                    )
                 }
                 Row(
                     modifier = Modifier
                         .align(Alignment.BottomStart)
                         .fillMaxWidth()
-                        .background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.82f))))
+                        .background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.88f))))
                         .padding(horizontal = 12.dp, vertical = 11.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                    verticalAlignment = Alignment.Bottom,
                 ) {
-                    Box(Modifier.size(6.dp).clip(CircleShape).background(Accent))
-                    Spacer(Modifier.width(7.dp))
-                    Text(
-                        text = state.ocrStatus,
-                        color = Foreground,
-                        fontSize = 10.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
+                    SpeedometerOverlay(speedKmh = state.speedKmh)
+                    Spacer(Modifier.weight(1f))
+                    Column(horizontalAlignment = Alignment.End, modifier = Modifier.widthIn(max = 150.dp)) {
+                        Text(
+                            text = state.ocrStatus,
+                            color = Foreground,
+                            fontSize = 9.sp,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            textAlign = TextAlign.End,
+                        )
+                        Spacer(Modifier.height(5.dp))
+                        CameraBadge(text = "GPS · ${state.gpsStatus.take(24)}", tint = Accent)
+                    }
                 }
             } else {
                 Column(
@@ -608,18 +666,15 @@ private fun CameraPanel(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    Icon(Icons.Filled.CameraAlt, contentDescription = null, tint = Accent.copy(alpha = 0.75f), modifier = Modifier.size(28.dp))
+                    Icon(Icons.Filled.CameraAlt, contentDescription = null, tint = Accent.copy(alpha = 0.75f), modifier = Modifier.size(29.dp))
                     Text(
-                        text = when {
-                            !cameraPermissionGranted -> "Camera permission needed"
-                            else -> "Camera paused"
-                        },
+                        text = if (cameraPermissionGranted) "Dashcam is paused" else "Camera permission needed",
                         color = Foreground,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.SemiBold,
                     )
                     Text(
-                        text = if (cameraPermissionGranted) "Start monitoring to turn on the rear camera." else "Allow camera access when you are ready to begin.",
+                        text = if (cameraPermissionGranted) "Start drive assist to open the road camera." else "Allow camera access to use sign reading and dashcam features.",
                         color = Muted,
                         fontSize = 10.sp,
                         textAlign = TextAlign.Center,
@@ -627,18 +682,109 @@ private fun CameraPanel(
                 }
             }
         }
-        Spacer(Modifier.height(10.dp))
+
+        Spacer(Modifier.height(9.dp))
         Text(
-            "CameraX requests up to 120 FPS when supported; OCR samples about 4 frames/sec. Hardware and camera-session limits can reduce the frame rate.",
-            color = Muted,
+            dashcam.status,
+            color = when {
+                dashcam.isRecording -> Danger
+                dashcam.isArmed -> Amber
+                else -> Muted
+            },
             fontSize = 10.sp,
-            lineHeight = 14.sp,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
         )
-        if (state.isRunning) {
-            Spacer(Modifier.height(5.dp))
-            Text(state.cameraStatus, color = Accent.copy(alpha = 0.9f), fontSize = 10.sp)
+        Spacer(Modifier.height(3.dp))
+        Text(dashcam.cameraStatus, color = if (state.isRunning) Accent else Muted, fontSize = 9.sp)
+        if (dashcam.lastEvent != null) {
+            Spacer(Modifier.height(3.dp))
+            Text("Last event · ${dashcam.lastEvent}", color = Amber, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        Spacer(Modifier.height(11.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(9.dp), modifier = Modifier.fillMaxWidth()) {
+            OutlinedButton(
+                onClick = onToggleEventCapture,
+                enabled = state.isRunning && cameraPermissionGranted && dashcam.cameraStatus.startsWith("Live"),
+                modifier = Modifier.weight(1f).height(46.dp),
+                shape = RoundedCornerShape(14.dp),
+                border = BorderStroke(1.dp, if (dashcam.isArmed) Amber else PanelBorder),
+            ) {
+                Text(
+                    if (dashcam.isArmed) "Events armed" else "Arm event clips",
+                    color = if (dashcam.isArmed) Amber else Muted,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                )
+            }
+            Button(
+                onClick = onToggleManualRecording,
+                enabled = state.isRunning && cameraPermissionGranted && dashcam.cameraStatus.startsWith("Live"),
+                modifier = Modifier.weight(1f).height(46.dp),
+                shape = RoundedCornerShape(14.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (dashcam.isRecording) Color(0xFF512628) else Color(0xFF25353D),
+                    contentColor = if (dashcam.isRecording) Color(0xFFFFA19B) else Foreground,
+                ),
+            ) {
+                Text(
+                    if (dashcam.isManualRecording) "Stop recording" else "Record now",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                )
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = when {
+                !state.isRunning -> "Start monitoring to enable dashcam controls."
+                dashcam.isArmed -> "Sudden movement or rapid GPS slowdown saves a 20-second local clip."
+                else -> "Event recording is opt-in. Clips begin after a trigger; no pre-event footage is buffered."
+            },
+            color = Muted,
+            fontSize = 9.sp,
+            lineHeight = 13.sp,
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "CameraX requests up to 120 FPS where supported; video may use a lower device-supported rate. OCR samples ~4 FPS. The GPS speed overlay is live-only, not burned into the silent video.",
+            color = Muted.copy(alpha = 0.82f),
+            fontSize = 9.sp,
+            lineHeight = 13.sp,
+        )
+    }
+}
+
+@Composable
+private fun SpeedometerOverlay(speedKmh: Float?) {
+    Surface(
+        color = Color(0xE607131B),
+        shape = RoundedCornerShape(15.dp),
+        border = BorderStroke(1.dp, Accent.copy(alpha = 0.35f)),
+    ) {
+        Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+            Text("GPS SPEED", color = Muted, fontSize = 8.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.2.sp)
+            Row(verticalAlignment = Alignment.Bottom) {
+                Text(
+                    speedKmh?.toInt()?.toString() ?: "—",
+                    color = if (speedKmh != null && speedKmh > 80f) Danger else Foreground,
+                    fontSize = 27.sp,
+                    lineHeight = 28.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+                Spacer(Modifier.width(5.dp))
+                Text("km/h", color = Muted, fontSize = 10.sp, modifier = Modifier.padding(bottom = 3.dp))
+            }
         }
     }
+}
+
+private fun formatClock(seconds: Int): String {
+    val minutes = seconds / 60
+    val remainder = seconds % 60
+    return "%02d:%02d".format(Locale.US, minutes, remainder)
 }
 
 @Composable
@@ -648,14 +794,23 @@ private fun CameraBadge(text: String, tint: Color) {
         color = Color(0xCC07131B),
         border = BorderStroke(1.dp, tint.copy(alpha = 0.34f)),
     ) {
-        Text(text, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp), color = tint, fontSize = 8.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+        Text(
+            text,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+            color = tint,
+            fontSize = 8.sp,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = 0.7.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
 @Composable
 private fun CameraLiveView(
+    cameraController: DashcamCameraController,
     onAnalyzeFrame: (ImageProxy) -> Unit,
-    onCameraStatus: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -667,112 +822,12 @@ private fun CameraLiveView(
         }
     }
 
-    androidx.compose.runtime.DisposableEffect(lifecycleOwner, previewView) {
-        var disposed = false
-        var boundProvider: ProcessCameraProvider? = null
-        var boundAnalysis: ImageAnalysis? = null
-        val analysisExecutor = Executors.newSingleThreadExecutor()
-        val mainExecutor = ContextCompat.getMainExecutor(context)
-        onCameraStatus("Opening CameraX rear camera…")
-
-        val providerFuture = ProcessCameraProvider.getInstance(context)
-        providerFuture.addListener({
-            if (disposed) return@addListener
-            try {
-                val provider = providerFuture.get()
-                boundProvider = provider
-                val cameraInfo = CameraSelector.DEFAULT_BACK_CAMERA
-                    .filter(provider.availableCameraInfos)
-                    .firstOrNull()
-                val rateChoices = supportedFrameRates(context, cameraInfo)
-                val attempts = mutableListOf<Range<Int>?>().apply {
-                    addAll(rateChoices)
-                    add(null)
-                }
-                var connected = false
-
-                for (requestedRate in attempts) {
-                    if (disposed) break
-                    var analysis: ImageAnalysis? = null
-                    try {
-                        val previewBuilder = Preview.Builder()
-                        val analysisBuilder = ImageAnalysis.Builder()
-                            .setTargetResolution(Size(1280, 720))
-                            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        if (requestedRate != null) {
-                            previewBuilder.setTargetFrameRate(requestedRate)
-                            analysisBuilder.setTargetFrameRate(requestedRate)
-                        }
-                        val preview = previewBuilder.build()
-                        val builtAnalysis = analysisBuilder.build()
-                        analysis = builtAnalysis
-                        builtAnalysis.setAnalyzer(analysisExecutor) { imageProxy -> onAnalyzeFrame(imageProxy) }
-                        preview.setSurfaceProvider(previewView.surfaceProvider)
-
-                        provider.unbindAll()
-                        provider.bindToLifecycle(
-                            lifecycleOwner,
-                            CameraSelector.DEFAULT_BACK_CAMERA,
-                            preview,
-                            builtAnalysis,
-                        )
-                        boundAnalysis = builtAnalysis
-                        val rateLabel = when {
-                            requestedRate == null -> "Live · device-default FPS · OCR samples ~4 FPS"
-                            requestedRate.upper >= 120 -> "Live · 120 FPS requested · OCR samples ~4 FPS"
-                            else -> "Live · up to ${requestedRate.upper} FPS requested · OCR samples ~4 FPS"
-                        }
-                        onCameraStatus(rateLabel)
-                        connected = true
-                        break
-                    } catch (exception: Exception) {
-                        analysis?.clearAnalyzer()
-                        provider.unbindAll()
-                        Log.w("RoadwiseADAS", "CameraX could not bind at requested frame range $requestedRate", exception)
-                    }
-                }
-                if (!connected && !disposed) {
-                    onCameraStatus("Camera could not start · close other camera apps and retry")
-                }
-            } catch (exception: Exception) {
-                Log.e("RoadwiseADAS", "Unable to initialize CameraX", exception)
-                if (!disposed) onCameraStatus("Camera unavailable · check camera permission")
-            }
-        }, mainExecutor)
-
-        onDispose {
-            disposed = true
-            boundAnalysis?.clearAnalyzer()
-            boundProvider?.unbindAll()
-            analysisExecutor.shutdownNow()
-            onCameraStatus("Camera paused")
-        }
+    androidx.compose.runtime.DisposableEffect(cameraController, lifecycleOwner, previewView) {
+        cameraController.bindCamera(lifecycleOwner, previewView, onAnalyzeFrame)
+        onDispose { cameraController.unbindCamera() }
     }
 
     AndroidView(factory = { previewView }, modifier = modifier)
-}
-
-@OptIn(ExperimentalCamera2Interop::class)
-private fun supportedFrameRates(
-    context: Context,
-    cameraInfo: androidx.camera.core.CameraInfo?,
-): List<Range<Int>> {
-    if (cameraInfo == null) return emptyList()
-    return try {
-        val cameraId = Camera2CameraInfo.from(cameraInfo).cameraId
-        val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        val ranges = manager.getCameraCharacteristics(cameraId)
-            .get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
-            ?.toList()
-            .orEmpty()
-        val atOrBelow120 = ranges
-            .filter { it.upper <= 120 }
-            .sortedWith(compareByDescending<Range<Int>> { it.upper }.thenByDescending { it.lower })
-        atOrBelow120.distinctBy { it.lower to it.upper }
-    } catch (exception: Exception) {
-        Log.w("RoadwiseADAS", "Unable to read camera FPS capabilities", exception)
-        emptyList()
-    }
 }
 
 @Composable

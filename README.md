@@ -4,13 +4,16 @@ A native Android proof-of-concept for foreground driving assistance. The app com
 
 ## What it does
 
-- Requests a CameraX frame-rate range up to **120 FPS when the selected camera and preview/analysis session support it**. CameraX/Android may fall back to a lower rate; the app reports the requested range. It is not possible to guarantee 120 FPS on every Android phone.
+- Requests a CameraX frame-rate range up to **120 FPS when the selected camera and preview/analysis/video session support it**. CameraX/Android may fall back to a lower rate; the app reports the requested range. It is not possible to guarantee 120 FPS on every Android phone.
 - Samples camera images for OCR at about **4 frames per second** to limit heat and battery use. It does not run neural-network OCR 120 times per second.
 - Uses the bundled, on-device ML Kit Latin text-recognition model. A conservative interpreter speaks speed-limit text when OCR includes speed/unit context, plus common text signs such as STOP, YIELD, SCHOOL, CROSSING, ROAD WORK, and road-direction words. Numeric-only text is not treated as a speed limit. Camera frames are processed on-device and are not uploaded by this app.
 - Monitors foreground GPS speed and speaks when its smoothed estimate is **above 80 km/h**, then repeats at a limited interval while the estimate remains above the threshold.
 - Reads short, road-related OCR lines aloud and shows the most recent cue.
-- Plays a user-selected audio file through Android's document picker and Media3/ExoPlayer. Audio focus is enabled so navigation speech can take priority.
-- Stops GPS monitoring when the app leaves the foreground. No background location service is used.
+- Provides an opt-in silent dashcam recording control using CameraX VideoCapture. Files are saved to `Movies/Roadwise` on Android 10+ (app-specific external storage on Android 9 and older). The live camera view overlays GPS speed; that overlay is not burned into the saved video.
+- When event clips are armed, a linear accelerometer impulse of about 5 m/s² or a smoothed GPS-speed drop of at least 15 km/h within 2.5 seconds can start a 20-second clip. These are heuristics, not crash detection, and bumps/GPS noise can cause false triggers. Event clips begin after the trigger; the app has no pre-event circular buffer. Continuous recording is manual and stops when the app leaves the foreground.
+- Provides destination handoff to Google Maps or another installed map app. This is not an embedded route renderer; leaving Roadwise stops camera/GPS monitoring.
+- Plays a user-selected audio file through Android's document picker and Media3/ExoPlayer. Audio focus is enabled so spoken alerts can take priority.
+- Stops GPS monitoring and dashcam recording when the app leaves the foreground. No background location or camera service is used.
 
 ## Important model and safety limits
 
