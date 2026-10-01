@@ -1,0 +1,126 @@
+name: Android signed APK
+
+on:
+  push:
+    branches:
+      - arena/01a0f8b4-have
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-signed-apk-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  signed-release:
+    name: Build and sign release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4.0.4
+
+      - name: Install Android 35 SDK packages
+        run: sdkmanager --install "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.9'
+
+      - name: Run unit tests
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          gradle --no-daemon --console=plain :app:testDebugUnitTest 2>&1 | tee "$RUNNER_TEMP/gradle-test.log"
+          gradle_status=${PIPESTATUS[0]}
+          set -e
+          if (( gradle_status != 0 )); then
+            diagnostic="$(python3 - "$RUNNER_TEMP/gradle-test.log" <<'PY'
+          import pathlib
+          import re
+          import sys
+          lines = pathlib.Path(sys.argv[1]).read_text(errors="replace").splitlines()
+          relevant = [line.strip() for line in lines if re.search(r"(^e: | error:|FAILURE:|What went wrong:|Execution failed for task|Could not resolve|Could not find|^\* Exception is:|^Caused by:)", line)]
+          detail = " | ".join(relevant[-18:] or lines[-18:])
+          detail = detail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A").replace("::", "%3A%3A")
+          print(detail[:3000])
+          PY
+          )"
+            echo "::error title=Gradle test failure diagnostics::$diagnostic"
+          fi
+          exit "$gradle_status"
+
+      - name: Check release signing secrets
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for secret_name in \
+            ANDROID_KEYSTORE_BASE64 \
+            ANDROID_KEYSTORE_PASSWORD \
+            ANDROID_KEY_ALIAS \
+            ANDROID_KEY_PASSWORD; do
+            if [[ -z "${!secret_name:-}" ]]; then
+              echo "::error::Missing GitHub Actions secret: ${secret_name}"
+              exit 1
+            fi
+          done
+
+      - name: Decode signing keystore
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          keystore_path="$RUNNER_TEMP/roadwise-release.jks"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore_path"
+          test -s "$keystore_path"
+          echo "ANDROID_KEYSTORE_PATH=$keystore_path" >> "$GITHUB_ENV"
+
+      - name: Build signed release APK
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: gradle --no-daemon --stacktrace :app:assembleRelease
+
+      - name: Verify APK signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk_path="app/build/outputs/apk/release/app-release.apk"
+          test -s "$apk_path"
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$sdk_root"
+          "$sdk_root/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$apk_path"
+
+      - name: Upload signed APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: roadwise-signed-release-apk
+          path: app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove temporary signing keystore
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/roadwise-release.jks"
