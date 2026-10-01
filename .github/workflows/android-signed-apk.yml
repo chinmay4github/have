@@ -40,7 +40,28 @@ jobs:
           gradle-version: '8.9'
 
       - name: Run unit tests
-        run: gradle --no-daemon :app:testDebugUnitTest
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          gradle --no-daemon --console=plain :app:testDebugUnitTest 2>&1 | tee "$RUNNER_TEMP/gradle-test.log"
+          gradle_status=${PIPESTATUS[0]}
+          set -e
+          if (( gradle_status != 0 )); then
+            diagnostic="$(python3 - "$RUNNER_TEMP/gradle-test.log" <<'PY'
+          import pathlib
+          import re
+          import sys
+          lines = pathlib.Path(sys.argv[1]).read_text(errors="replace").splitlines()
+          relevant = [line.strip() for line in lines if re.search(r"(^e: | error:|FAILURE:|What went wrong:|Execution failed for task|Could not resolve|Could not find|^\* Exception is:|^Caused by:)", line)]
+          detail = " | ".join(relevant[-18:] or lines[-18:])
+          detail = detail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A").replace("::", "%3A%3A")
+          print(detail[:3000])
+          PY
+          )"
+            echo "::error title=Gradle test failure diagnostics::$diagnostic"
+          fi
+          exit "$gradle_status"
 
       - name: Check release signing secrets
         shell: bash
