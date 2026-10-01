@@ -81,27 +81,35 @@ class DriveAssistController(
         }
     }
 
-    private val textToSpeech = TextToSpeech(appContext) { status ->
-        if (status == TextToSpeech.SUCCESS) {
-            try {
-                val english = Locale.US
-                if (textToSpeech.isLanguageAvailable(english) >= TextToSpeech.LANG_AVAILABLE) {
-                    textToSpeech.language = english
-                }
-                textToSpeech.setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                        .build(),
-                )
-                ttsReady = true
-                pendingSpeech?.let { queued ->
-                    pendingSpeech = null
-                    speak(queued, urgent = false)
-                }
-            } catch (exception: Exception) {
-                Log.w("RoadwiseADAS", "Unable to configure speech output", exception)
+    private lateinit var textToSpeech: TextToSpeech
+
+    init {
+        textToSpeech = TextToSpeech(appContext) { status ->
+            // Post until the constructor has assigned the engine to the property.
+            mainHandler.post { configureTextToSpeech(status) }
+        }
+    }
+
+    private fun configureTextToSpeech(status: Int) {
+        if (status != TextToSpeech.SUCCESS) return
+        try {
+            val english = Locale.US
+            if (textToSpeech.isLanguageAvailable(english) >= TextToSpeech.LANG_AVAILABLE) {
+                textToSpeech.language = english
             }
+            textToSpeech.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build(),
+            )
+            ttsReady = true
+            pendingSpeech?.let { queued ->
+                pendingSpeech = null
+                speak(queued, urgent = false)
+            }
+        } catch (exception: Exception) {
+            Log.w("RoadwiseADAS", "Unable to configure speech output", exception)
         }
     }
 

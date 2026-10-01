@@ -70,6 +70,7 @@ class DashcamCameraController(
     private var boundAnalysis: ImageAnalysis? = null
     private var analysisExecutor: ExecutorService? = null
     private var videoCapture: VideoCapture<Recorder>? = null
+    private var recorder: Recorder? = null
     private var activeRecording: Recording? = null
     private var recordingMode: RecordingMode? = null
     private var recordingStartedAt = 0L
@@ -126,8 +127,9 @@ class DashcamCameraController(
                             .setTargetResolution(Size(1280, 720))
                             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                         if (requestedRate != null) {
+                            // CameraX exposes target frame-rate hints on Preview; video/analysis
+                            // may still run at a lower rate to satisfy the camera's session limits.
                             previewBuilder.setTargetFrameRate(requestedRate)
-                            analysisBuilder.setTargetFrameRate(requestedRate)
                         }
 
                         val preview = previewBuilder.build()
@@ -158,6 +160,7 @@ class DashcamCameraController(
                         boundProvider = provider
                         boundAnalysis = imageAnalysis
                         videoCapture = video
+                        this@DashcamCameraController.recorder = recorder
                         val fpsLabel = when {
                             requestedRate == null -> "Live · dashcam ready · device-default FPS"
                             requestedRate.upper >= 120 -> "Live · 120 FPS requested · video session may use less"
@@ -262,6 +265,7 @@ class DashcamCameraController(
         boundProvider?.unbindAll()
         boundProvider = null
         videoCapture = null
+        recorder = null
         analysisExecutor?.shutdownNow()
         analysisExecutor = null
         updateState { it.copy(cameraStatus = "Camera paused") }
@@ -273,15 +277,15 @@ class DashcamCameraController(
     }
 
     private fun startRecording(mode: RecordingMode, reason: String) {
-        val capture = videoCapture
-        if (capture == null) {
+        val activeRecorder = recorder
+        if (videoCapture == null || activeRecorder == null) {
             updateState { it.copy(status = "Camera is not ready · recording unavailable") }
             return
         }
 
         try {
             val outputOptions = createOutputOptions(mode, reason)
-            val pending = capture.output
+            val pending = activeRecorder
                 .prepareRecording(appContext, outputOptions)
                 .start(mainExecutor) { event -> onRecordEvent(event, mode, reason) }
             activeRecording = pending
