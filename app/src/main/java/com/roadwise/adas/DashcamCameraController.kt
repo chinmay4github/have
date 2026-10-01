@@ -285,9 +285,14 @@ class DashcamCameraController(
 
         try {
             val outputOptions = createOutputOptions(mode, reason)
-            val pending = activeRecorder
-                .prepareRecording(appContext, outputOptions)
-                .start(mainExecutor) { event -> onRecordEvent(event, mode, reason) }
+            val pendingRecording = when (outputOptions) {
+                is FileOutputOptions -> activeRecorder.prepareRecording(appContext, outputOptions)
+                is MediaStoreOutputOptions -> activeRecorder.prepareRecording(appContext, outputOptions)
+                else -> error("Unsupported dashcam output options")
+            }
+            val pending = pendingRecording.start(mainExecutor) { event ->
+                onRecordEvent(event, mode, reason)
+            }
             activeRecording = pending
             recordingMode = mode
             recordingStartedAt = SystemClock.elapsedRealtime()
