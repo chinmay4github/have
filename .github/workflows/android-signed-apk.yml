@@ -1,23 +1,26 @@
-name: Android signed APK
+name: Android APK
 
 on:
   push:
     branches:
-      - arena/01a0f8b4-have
+      - master
+      - "arena/**"
+    tags:
+      - "v*"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: android-signed-apk-${{ github.ref }}
+  group: android-apk-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  signed-release:
-    name: Build and sign release APK
+  build-apk:
+    name: Build installable APK
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 40
     steps:
       - name: Check out source
         uses: actions/checkout@v6
@@ -63,7 +66,8 @@ jobs:
           fi
           exit "$gradle_status"
 
-      - name: Check release signing secrets
+      - name: Choose signing mode
+        id: signing
         shell: bash
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -72,55 +76,149 @@ jobs:
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          for secret_name in \
-            ANDROID_KEYSTORE_BASE64 \
-            ANDROID_KEYSTORE_PASSWORD \
-            ANDROID_KEY_ALIAS \
-            ANDROID_KEY_PASSWORD; do
-            if [[ -z "${!secret_name:-}" ]]; then
-              echo "::error::Missing GitHub Actions secret: ${secret_name}"
-              exit 1
-            fi
-          done
+          mode="ephemeral"
+          if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" \
+            && -n "${ANDROID_KEYSTORE_PASSWORD:-}" \
+            && -n "${ANDROID_KEY_ALIAS:-}" \
+            && -n "${ANDROID_KEY_PASSWORD:-}" ]]; then
+            mode="release"
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          if [[ "$mode" == "release" ]]; then
+            echo "::notice title=Signing::Signing with the repository release keystore."
+          else
+            echo "::warning title=Release signing secrets not configured::Building an installable release APK signed with a temporary CI keystore. Add ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS and ANDROID_KEY_PASSWORD (Settings -> Secrets and variables -> Actions) to keep one stable signature across builds."
+          fi
 
-      - name: Decode signing keystore
+      - name: Prepare signing keystore
         shell: bash
         env:
+          MODE: ${{ steps.signing.outputs.mode }}
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
           umask 077
-          keystore_path="$RUNNER_TEMP/roadwise-release.jks"
-          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore_path"
-          test -s "$keystore_path"
-          echo "ANDROID_KEYSTORE_PATH=$keystore_path" >> "$GITHUB_ENV"
+          keystore_path="$RUNNER_TEMP/roadwise-release.p12"
+          if [[ "$MODE" == "release" ]]; then
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore_path"
+            test -s "$keystore_path"
+            {
+              echo "ANDROID_KEYSTORE_PATH=$keystore_path"
+              echo "ANDROID_KEYSTORE_PASSWORD=$ANDROID_KEYSTORE_PASSWORD"
+              echo "ANDROID_KEY_ALIAS=$ANDROID_KEY_ALIAS"
+              echo "ANDROID_KEY_PASSWORD=$ANDROID_KEY_PASSWORD"
+            } >> "$GITHUB_ENV"
+          else
+            store_password="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
+            keytool -genkeypair \
+              -keystore "$keystore_path" \
+              -storetype PKCS12 \
+              -alias roadwise \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass "$store_password" \
+              -keypass "$store_password" \
+              -dname "CN=Roadwise CI ephemeral, OU=Prototype, O=Roadwise, L=NA, ST=NA, C=IN"
+            {
+              echo "ANDROID_KEYSTORE_PATH=$keystore_path"
+              echo "ANDROID_KEYSTORE_PASSWORD=$store_password"
+              echo "ANDROID_KEY_ALIAS=roadwise"
+              echo "ANDROID_KEY_PASSWORD=$store_password"
+              echo "ANDROID_KEYSTORE_TYPE=PKCS12"
+            } >> "$GITHUB_ENV"
+          fi
 
-      - name: Build signed release APK
-        env:
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      - name: Build release APK
         run: gradle --no-daemon --stacktrace :app:assembleRelease
 
-      - name: Verify APK signature
+      - name: Build debug APK fallback
+        if: failure()
+        run: gradle --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Verify APK and write build info
+        if: always()
         shell: bash
         run: |
-          set -euo pipefail
-          apk_path="app/build/outputs/apk/release/app-release.apk"
-          test -s "$apk_path"
+          set -uo pipefail
           sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
-          test -n "$sdk_root"
-          "$sdk_root/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$apk_path"
+          info_dir="app/build/outputs/apk"
+          mkdir -p "$info_dir"
+          info_file="$info_dir/BUILD-INFO.txt"
+          {
+            echo "commit: $GITHUB_SHA"
+            echo "ref: $GITHUB_REF"
+            echo "run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "signing_mode: ${{ steps.signing.outputs.mode }}"
+            if [[ "${{ steps.signing.outputs.mode }}" == "ephemeral" ]]; then
+              echo "signing_note: signed with a temporary CI keystore; configure the ANDROID_* secrets for a stable release signature"
+            fi
+          } > "$info_file"
+          found=0
+          while IFS= read -r apk; do
+            found=1
+            echo "--- $apk"
+            ls -l "$apk"
+            sha256sum "$apk" | tee -a "$info_file"
+            if [[ -n "$sdk_root" && -x "$sdk_root/build-tools/35.0.0/apksigner" ]]; then
+              "$sdk_root/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$apk"
+            fi
+          done < <(find "$info_dir" -name '*.apk' -type f)
+          if (( found == 0 )); then
+            echo "::error title=No APK produced::Neither the release nor the debug build produced an APK."
+            exit 1
+          fi
 
-      - name: Upload signed APK
+      - name: Upload APK
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: roadwise-signed-release-apk
-          path: app/build/outputs/apk/release/app-release.apk
+          name: roadwise-apk
+          path: |
+            app/build/outputs/apk/release/*.apk
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/BUILD-INFO.txt
           if-no-files-found: error
           retention-days: 30
 
       - name: Remove temporary signing keystore
         if: always()
         shell: bash
-        run: rm -f "$RUNNER_TEMP/roadwise-release.jks"
+        run: rm -f "$RUNNER_TEMP/roadwise-release.p12"
+
+  publish-release:
+    name: Attach APK to GitHub release
+    needs: build-apk
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download APK artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: roadwise-apk
+          path: apk
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t apks < <(find apk -name '*.apk' -type f)
+          if (( ${#apks[@]} == 0 )); then
+            echo "::error::No APK found in the build artifact."
+            exit 1
+          fi
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${apks[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$GITHUB_REF_NAME" "${apks[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Roadwise Drive Assist $GITHUB_REF_NAME" \
+              --notes "Prototype Android APK built from $GITHUB_SHA. See README for limitations."
+          fi
