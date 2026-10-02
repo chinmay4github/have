@@ -8,6 +8,7 @@ val releaseKeystorePath = providers.environmentVariable("ANDROID_KEYSTORE_PATH")
 val releaseKeystorePassword = providers.environmentVariable("ANDROID_KEYSTORE_PASSWORD").orNull
 val releaseKeyAlias = providers.environmentVariable("ANDROID_KEY_ALIAS").orNull
 val releaseKeyPassword = providers.environmentVariable("ANDROID_KEY_PASSWORD").orNull
+val releaseKeyStoreType = providers.environmentVariable("ANDROID_KEYSTORE_TYPE").orNull
 
 android {
     namespace = "com.roadwise.adas"
@@ -29,13 +30,20 @@ android {
                 storePassword = releaseKeystorePassword
                 keyAlias = releaseKeyAlias
                 keyPassword = releaseKeyPassword
+                if (!releaseKeyStoreType.isNullOrBlank()) {
+                    storeType = releaseKeyStoreType
+                }
             }
         }
     }
 
     buildTypes {
         getByName("release") {
-            signingConfig = signingConfigs.getByName("release")
+            // Only attach signing when a keystore is supplied, so the release
+            // build type stays usable for plain (unsigned) compile checks.
+            if (!releaseKeystorePath.isNullOrBlank()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             isMinifyEnabled = false
         }
     }

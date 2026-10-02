@@ -27,15 +27,20 @@ Open this folder in Android Studio with JDK 17, Gradle 8.9, and Android SDK 35 i
 
 Unit tests cover conservative sign-text interpretation in `app/src/test`. Run them from Android Studio or with Gradle using `:app:testDebugUnitTest`.
 
-## GitHub signed APK workflow
+## GitHub APK workflow (download an installable APK)
 
-`.github/workflows/android-signed-apk.yml` runs on pushes to the Arena session branch and can also be started with **Actions → Android signed APK → Run workflow**. It runs the unit tests, builds `:app:assembleRelease`, verifies the APK signature, and uploads `roadwise-signed-release-apk` as a workflow artifact.
+`.github/workflows/android-signed-apk.yml` (display name **Android APK**) runs on pushes to `master` and `arena/**` branches and can also be started with **Actions → Android APK → Run workflow**. It runs the unit tests, builds `:app:assembleRelease`, verifies the APK signature with `apksigner`, and uploads the artifact **`roadwise-apk`** (the APK plus `BUILD-INFO.txt` with commit, signing mode, and SHA-256). Push a tag such as `v1.0.0` to additionally attach the APK to a GitHub Release.
 
-Before the workflow can produce a signed APK, add these repository Actions secrets (Settings → Secrets and variables → Actions):
+Download it: **Actions → Android APK → latest run → Artifacts → roadwise-apk**, and keep the `.apk` inside. Unzip on the phone or sideload with `adb install -r app-release.apk`. Android will ask you to allow installing from the source you use.
 
-- `ANDROID_KEYSTORE_BASE64` — base64 of a persistent release `.jks` keystore
-- `ANDROID_KEYSTORE_PASSWORD`
-- `ANDROID_KEY_ALIAS`
-- `ANDROID_KEY_PASSWORD`
+Signing has two modes:
 
-Generate the keystore once with `keytool`, encode it locally (for example, `base64 -w0 roadwise-release.jks` on Linux), and store the keystore backup safely. Do not commit the keystore or paste signing secrets into chat. Keep using the same keystore for future app updates; a newly generated key cannot update an APK signed with the old key. The workflow fails early with a clear error if the required secrets are missing.
+- **Ephemeral (default, no setup):** with no secrets configured the workflow generates a temporary keystore, so every run still produces an installable APK. This is fine for testing but the signature changes per run, so Android will refuse in-place updates and may request an uninstall first.
+- **Stable release (recommended for sharing):** add these repository Actions secrets (Settings → Secrets and variables → Actions) and the same workflow signs with your own key:
+
+  - `ANDROID_KEYSTORE_BASE64` — base64 of a persistent release keystore
+  - `ANDROID_KEYSTORE_PASSWORD`
+  - `ANDROID_KEY_ALIAS`
+  - `ANDROID_KEY_PASSWORD`
+
+Generate the keystore once with `keytool` (for example `keytool -genkeypair -v -keystore roadwise-release.jks -alias roadwise -keyalg RSA -keysize 2048 -validity 10000`), encode it locally (`base64 -w0 roadwise-release.jks` on Linux), and store the file and passwords somewhere safe. Do not commit the keystore or paste signing secrets into chat. Keep using the same keystore for future updates; a newly generated key cannot update an APK signed with the old key. A `.jks` keystore works with `keytool`, but Gradle's PKCS12 loader only applies the supplied passwords directly to PKCS12 stores, so prefer exporting to `.p12`/PKCS12 (`keytool -importkeystore -srckeystore roadwise-release.jks -destkeystore roadwise-release.p12 -deststoretype PKCS12`) if signing fails with a wrong-password error.
